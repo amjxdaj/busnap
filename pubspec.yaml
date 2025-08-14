@@ -43,6 +43,7 @@ dependencies:
   http: ^1.2.1
   shared_preferences: ^2.2.2
   audioplayers: ^5.2.1
+  connectivity_plus: ^5.0.2
 
 
 

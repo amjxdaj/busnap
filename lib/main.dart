@@ -3,6 +3,8 @@ import 'package:geocoding/geocoding.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'services/distance_service.dart';
+import 'services/connectivity_service.dart';
+import 'services/background_location_service.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
@@ -12,7 +14,12 @@ import 'dart:async';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Initialize background location service
+  await BackgroundLocationService.initialize();
+
   runApp(const BusnapApp());
 }
 
@@ -127,6 +134,10 @@ class _HomePageState extends State<HomePage>
   double? _lastDistanceToDest;
   LatLng? _lastTrackedLatLng;
   StreamSubscription<Position>? _journeyPositionSub;
+
+  // Services
+  final ConnectivityService _connectivityService = ConnectivityService();
+  bool _isBackgroundTracking = false;
 
   @override
   void initState() {
@@ -326,7 +337,12 @@ class _HomePageState extends State<HomePage>
   }
 
   @override
-  void dispose() {
+  void dispose() async {
+    // Stop background tracking if active
+    if (_isBackgroundTracking) {
+      await BackgroundLocationService.stopBackgroundTracking();
+    }
+
     _controller.dispose();
     destinationController.dispose();
     _journeyPositionSub?.cancel();
@@ -337,6 +353,15 @@ class _HomePageState extends State<HomePage>
   }
 
   Future<void> convertToCoordinates(String placeName) async {
+    // Check internet connectivity first
+    if (!mounted) return;
+    final hasInternet = await _connectivityService.requestInternetConnection(
+      context,
+    );
+    if (!hasInternet) {
+      return;
+    }
+
     try {
       List<Location> locations = await locationFromAddress(placeName);
       if (locations.isNotEmpty) {
@@ -371,6 +396,15 @@ class _HomePageState extends State<HomePage>
     double destLat,
     double destLng,
   ) async {
+    // Check internet connectivity
+    if (!mounted) return;
+    final hasInternet = await _connectivityService.requestInternetConnection(
+      context,
+    );
+    if (!hasInternet) {
+      return;
+    }
+
     var status = await Permission.location.request();
     if (!status.isGranted) {
       setState(() {
@@ -420,15 +454,46 @@ class _HomePageState extends State<HomePage>
     }
   }
 
-  void _startJourney() {
-    setState(() {
-      _journeyStarted = true;
-      _timerDisplay = '00:00:00';
-      _journeyTimer = Stopwatch()..start();
-      _lastTrackedLatLng = _currentLatLng;
-    });
-    _startJourneyTimer();
-    _startLiveDistanceTracking();
+  void _startJourney() async {
+    if (_destinationLatLng == null) return;
+
+    // Start background location tracking
+    final success = await BackgroundLocationService.startBackgroundTracking(
+      destination: _destinationLatLng!,
+      onLocationUpdate: (LatLng location) {
+        setState(() {
+          _currentLatLng = location;
+        });
+        _updateDistanceToDestination(location);
+      },
+      onDistanceUpdate: (double distance) {
+        _checkDistanceThresholds(distance);
+      },
+    );
+
+    if (success) {
+      setState(() {
+        _journeyStarted = true;
+        _isBackgroundTracking = true;
+        _timerDisplay = '00:00:00';
+        _journeyTimer = Stopwatch()..start();
+        _lastTrackedLatLng = _currentLatLng;
+      });
+      _startJourneyTimer();
+      _startLiveDistanceTracking();
+    } else {
+      // Show error message
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Failed to start background tracking. Please check permissions.',
+            ),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
   }
 
   void _startJourneyTimer() {
@@ -458,9 +523,14 @@ class _HomePageState extends State<HomePage>
         ).listen((Position position) async {
           if (!_journeyStarted) return;
           final latLng = LatLng(position.latitude, position.longitude);
-          setState(() {
-            _currentLatLng = latLng;
-          });
+
+          // Check if widget is still mounted before calling setState
+          if (mounted) {
+            setState(() {
+              _currentLatLng = latLng;
+            });
+          }
+
           if (_destinationLatLng != null && _lastTrackedLatLng != null) {
             final kmMoved = const Distance().as(
               LengthUnit.Kilometer,
@@ -477,13 +547,20 @@ class _HomePageState extends State<HomePage>
                 endLat: _destinationLatLng!.latitude,
                 endLng: _destinationLatLng!.longitude,
               );
-              setState(() {
-                liveLatLngResult =
-                    "${routeData['distance_km']} km | ${routeData['duration_min']} min";
-                _routePolyline = List<LatLng>.from(routeData['route_points']);
-                _lastDistanceToDest = double.tryParse(routeData['distance_km']);
-                _lastTrackedLatLng = latLng;
-              });
+
+              // Check if widget is still mounted before calling setState
+              if (mounted) {
+                setState(() {
+                  liveLatLngResult =
+                      "${routeData['distance_km']} km | ${routeData['duration_min']} min";
+                  _routePolyline = List<LatLng>.from(routeData['route_points']);
+                  _lastDistanceToDest = double.tryParse(
+                    routeData['distance_km'],
+                  );
+                  _lastTrackedLatLng = latLng;
+                });
+              }
+
               // Notification threshold check (5km, 2km, 1km)
               double distanceKm =
                   double.tryParse(routeData['distance_km']) ?? 0;
@@ -502,9 +579,13 @@ class _HomePageState extends State<HomePage>
         });
   }
 
-  void _stopJourney() {
+  void _stopJourney() async {
+    // Stop background location tracking
+    await BackgroundLocationService.stopBackgroundTracking();
+
     setState(() {
       _journeyStarted = false;
+      _isBackgroundTracking = false;
       _journeyTimer?.stop();
       _journeyTimer = null;
       _timerDisplay = '';
@@ -513,6 +594,44 @@ class _HomePageState extends State<HomePage>
     });
     _journeyPositionSub?.cancel();
     _journeyOverviewTimer?.cancel();
+  }
+
+  /// Update distance to destination using the distance service
+  void _updateDistanceToDestination(LatLng currentLocation) async {
+    if (_destinationLatLng == null) return;
+
+    try {
+      final distanceService = DistanceService();
+      final routeData = await distanceService.getRouteData(
+        startLat: currentLocation.latitude,
+        startLng: currentLocation.longitude,
+        endLat: _destinationLatLng!.latitude,
+        endLng: _destinationLatLng!.longitude,
+      );
+
+      setState(() {
+        liveLatLngResult =
+            "${routeData['distance_km']} km | ${routeData['duration_min']} min";
+        _routePolyline = List<LatLng>.from(routeData['route_points']);
+        _lastDistanceToDest = double.tryParse(routeData['distance_km']);
+        _lastTrackedLatLng = currentLocation;
+      });
+    } catch (e) {
+      debugPrint('Error updating distance: $e');
+    }
+  }
+
+  /// Check distance thresholds and trigger alerts
+  void _checkDistanceThresholds(double distanceKm) {
+    for (final threshold in [5, 2, 1]) {
+      if (distanceKm <= threshold && !_alertedThresholds.contains(threshold)) {
+        debugPrint(
+          'Triggering notification for $threshold km, current distance: $distanceKm',
+        );
+        _showAlertNotification(threshold);
+        _alertedThresholds.add(threshold);
+      }
+    }
   }
 
   @override
@@ -1053,14 +1172,59 @@ class _HomePageState extends State<HomePage>
                             if (_journeyStarted)
                               Column(
                                 children: [
-                                  Text(
-                                    'Journey Timer: $_timerDisplay',
-                                    style: const TextStyle(
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.bold,
-                                      color: Colors.green,
-                                    ),
+                                  Row(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      Icon(
+                                        Icons.timer,
+                                        color: Colors.green.shade600,
+                                        size: 20,
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Text(
+                                        'Journey Timer: $_timerDisplay',
+                                        style: const TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.bold,
+                                          color: Colors.green,
+                                        ),
+                                      ),
+                                    ],
                                   ),
+                                  const SizedBox(height: 6),
+                                  if (_isBackgroundTracking)
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 12,
+                                        vertical: 6,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: Colors.blue.shade50,
+                                        borderRadius: BorderRadius.circular(20),
+                                        border: Border.all(
+                                          color: Colors.blue.shade200,
+                                        ),
+                                      ),
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Icon(
+                                            Icons.location_on,
+                                            color: Colors.blue.shade600,
+                                            size: 16,
+                                          ),
+                                          const SizedBox(width: 6),
+                                          Text(
+                                            'Background Tracking Active',
+                                            style: TextStyle(
+                                              fontSize: 12,
+                                              color: Colors.blue.shade700,
+                                              fontWeight: FontWeight.w500,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
                                   const SizedBox(height: 6),
                                   OutlinedButton.icon(
                                     icon: const Icon(Icons.stop),
